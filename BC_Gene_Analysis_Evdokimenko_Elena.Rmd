@@ -1,0 +1,653 @@
+---
+title: "Breast Cancer: Gene Expression Analysis and Interpretation"
+author: "Elena Evdokimenko" 
+date: "`r format(Sys.Date(), '%B, %Y')`"
+output: html_notebook
+---
+
+I have downloaded the dataset from <https://www.cbioportal.org/study/summary?id=brca_tcga_pan_can_atlas_2018>, unzipped it manually (there was a nested archive inside it, so unzipped that one too). Then I copied the 3 files I need for analysis into the folder *Data* in my R project folder.
+
+## Reading data sets and matching Patient ID with Sample ID 
+
+Reading the files. RNA sequences file takes time as it contains around 20,000 lines with ~ 1,000 variables in each line.
+
+```{r}
+# patients clinical data
+data_patient = read.delim("Data/data_clinical_patient.txt")
+
+# file with Copy Number Alterations
+data_cna = read.delim("Data/data_cna.txt")
+
+# file with RNA sequences
+data_rna_seq = read.delim("Data/data_mrna_seq_v2_rsem.txt")
+```
+
+Top match Patient Data IDs with RNA-seq and CNA identifiers, first looking at the file which provides mapping of a patient clinical info to a sample:
+
+```{r}
+data_mapping = read.delim("Data/data_clinical_sample.txt")
+# show the mapping
+data_mapping
+```
+As can be seen from the mapping, identifiers to uniquely specify a patient follow the format of "TCGA-3C-AAAU" and the corresponding sample identifiers have "-01" at the end, e.g., has a format of "TCGA-3C-AAAU-01".
+
+The patients clinical data has the following columns:
+
+```{r}
+# inspect column names of the data_patient data frame
+colnames(data_patient)
+```
+
+The patient ID is the first column named `X.Patient.Identifier`. Example values of the `X.Patient.Identifier` column are:	
+```{r}
+# rows from 6 to 10 of the Patient ID column
+data_patient$X.Patient.Identifier[6:10]
+```
+
+Inspecting column names of the Copy Number Alteration data_cna data frame. The first 10 columns only, since the dataframe has more than 1,000 columns:
+
+```{r}
+str(data_cna, list.len = 10)
+```
+The output of the `str()` function showed that in the Copy Number Alterations (CNA) dataset, the first two columns are genes, and the rest columns are Sample IDs. Each **Sample ID in CNA dataset can be calculated from the Patient ID** by replacing "-" with "." and adding "01".
+
+Inspecting the RNA-seq dataframe - the first 10 columns since there are more than 1,000 (one per patient):
+
+```{r}
+str(data_rna_seq, list.len = 10)
+```
+The output of the `str()` function showed that in the RNA-seq dataset, the first two columns are also genes, and remaining columns are Sample IDs.  
+
+Same as was observed with the CNA dataset, **Sample ID in RNA-seq file can be calculated from the Patient ID** by replacing "-" with "." and adding "01".
+
+## Creation of metadata using the CNA level of ERBB2+ (greater than 0 means amplified)
+
+Metadata is a matrix of the following size:
+ number of rows = number of samples in RNA assay,
+ number of columns = 1.
+
+Element value will be either 1 (ERBB2 Amplified) or 0 (Not Amplified).
+
+```{r}
+# substract all columns with Samples from RNA-seq dataset
+# they are all columns except the first two
+# and convert into matrix
+rna_assay = as.matrix(data_rna_seq[,-c(1,2)])
+
+# give name for rows
+rownames(rna_assay) = data_rna_seq[,1]
+
+# check size of rna_assay
+print("Size of rna_assay:")
+dim(rna_assay)
+
+# metadata is a matrix of the following size:
+# number of rows = number of samples in rna_assay
+# number of columns = 1
+# initialise with 0
+metadataERBB2 = matrix(0, dim(rna_assay)[2], 1)
+
+# size of the metadata matrix
+print("Size of metadata matrix:")
+dim(metadataERBB2)
+```
+Logic to fill in the metadata matrix: 
+
+```{r}
+# iterate over each sample in the RNA assay and 
+# take a sample ID
+# and use it to retrieve an element in the CNA dataset at the position:
+#     row = row in which the Hugo_Symbol is equal to ERBB2 gene
+#     column = column which has the name equal to the current sample ID
+for (i in 1:dim(rna_assay)[2]){
+  
+  # each column name in RNA assay is a Sample ID
+  sample_id = colnames(rna_assay)[i]
+
+  value = data_cna[data_cna$Hugo_Symbol == "ERBB2", sample_id]
+  
+  if (length(value) > 0 && !is.na(value)){
+    
+    if (value > 0) amplified = 1
+    else amplified = 0 
+    
+    # write the value into the metadata matrix
+    metadataERBB2[i,1] = amplified
+  }
+}
+
+# give the single column of the metadata matrix a name
+colnames(metadataERBB2)[1] = "Amplified"
+
+# give names to rows of the metadata matrix, which are Sample IDs
+# they should be equal to column names of the RNA assay (Sample IDs)
+rownames(metadataERBB2) = colnames(rna_assay)
+```
+
+View the metadata matrix:
+
+```{r}
+# first 10 rows
+print(head(metadataERBB2,10))
+```
+
+It can be seen that the matrix has row names equal to Sample IDs, and a single column "Amplified" containing 0 or 1.
+
+Checking that there are no NA in the metadata. There shouldn't be any NA because the matrix was initialised with 0.
+
+```{r}
+# print TRUE if there are no NA in the matrix
+print(all(!is.na(metadataERBB2)))
+```
+Installing packages for Differential Expression Genes (DEG) analysis:
+
+```{r}
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+# Install DeSeq2
+BiocManager::install("DESeq2")
+
+library(DESeq2)
+```
+
+For DEG analysis, need to construct an object of the type `DESeqDataSet` which contains input values, intermediate calculations and results of DEG analysis. I will use the `DESeqDataSetFromMatrix` function from the `DESeq2` package.
+
+Data preparation:
+
+```{r}
+# round the values in rna_assay,
+# because DESeq expects input as counts as are integer numbers
+rna_assay = round(rna_assay)
+
+rna_assay[is.na(rna_assay)] = 0  # replace NA with zeros
+rna_assay[rna_assay < 0] = 0 # replace negative values with zeros
+
+# filter out genes with too many missing values 
+# keep the gene (row) only if it has at least 3 samples with value > 10
+smallestGroupSize = 3
+
+# vector that contains TRUE or FALSE for each gene
+keep_gene = rowSums(rna_assay >= 10) >= smallestGroupSize 
+
+# keep rows only if keep_gene = TRUE for that row
+rna_assay = rna_assay[keep_gene,] 
+```
+
+Checking the size after rows with many missing values were removed:
+
+```{r}
+print(
+  paste("Size of the RNA assay after removing genes with low counts: ",
+        paste(dim(rna_assay), collapse = " x ")))
+```
+
+It can be seen that around 2,000 genes were removed and 18,603 genes were kept. 
+
+Creating the `DESeqDataSet` object, which contains inputs, intermediate calculation, and result of DEG analysis:
+
+```{r}
+# create DESeqDataSet instance
+dds =  DESeqDataSetFromMatrix(
+  countData = rna_assay, # input with counts for genes
+  colData = metadataERBB2, # colData rows must match countData columns
+  design = ~ Amplified) # formula how the counts for each gene depend on colData
+```
+
+The counts that I provided in the rna_assay are not normalized, and this is expected by the `DESeq()` function, based on the documentation at bioconducter.org.
+
+### Run differential expression analysis
+
+The `DESEq()` function performs estimation of size factors, estimation of dispersion, Negative Binomial GLM fitting and Wald statistics.
+
+```{r}
+# Run differential expression analysis
+dds <- DESeq(dds)
+```
+
+Names of the estimated effects (coefficients) of the model:
+
+```{r}
+resultsNames(dds)
+```
+
+To access results of DEG analysis, calling the `results()` function:
+
+```{r}
+res = results(dds)
+```
+
+Top 10 most differentially expressed genes ordered by p-adjusted value:
+
+```{r}
+# order by p-adjusted value
+top_10_genes_padj = res[order(res$padj)[1:10],]
+# print
+print(top_10_genes_padj)
+```
+
+Top 10 upregulated genes based on the fold change: 
+
+```{r}
+# order by log2 fold change
+# when using descending order, log2 > 0
+# and so returns top 10 upregulated genes
+top_10_genes_log2fc_up = res[order(res$log2FoldChange, decreasing = TRUE)[1:10],]
+print(top_10_genes_log2fc_up)
+```
+
+Top 10 downregulated genes based on the fold change: 
+
+```{r}
+# order by log2 fold change
+# when using ascending order, log2 < 0
+# and so returns top 10 downregulated genes
+top_10_genes_log2fc_down = res[order(res$log2FoldChange, decreasing = FALSE)[1:10],]
+print(top_10_genes_log2fc_down)
+```
+
+## Pathway Enrichment
+
+Required packages:
+
+```{r}
+if (!requireNamespace("clusterProfiler", quietly = TRUE))
+  BiocManager::install("clusterProfiler")
+if (!requireNamespace("org.Hs.eg.db", quietly = TRUE))
+  BiocManager::install("org.Hs.eg.db")
+if (!requireNamespace("enrichplot", quietly = TRUE))
+  install.packages("enrichplot")
+
+library(clusterProfiler)
+library(enrichplot)
+library(org.Hs.eg.db)
+```
+
+Using differential expressed genes, which were obtained by DESeq() function, with p-adjusted < 0.05:
+
+```{r}
+# filter DESEq results to keep 
+# differentially expressed genes with p-adjusted < 0.05
+res_significant = res[res$padj<0.05,]
+
+# separate into over- and underexpressed by log2 fold change
+
+# overexpressed
+res_over  = rownames(res_significant[res_significant$log2FoldChange > 0,])
+
+# underexpressed
+res_under = rownames(res_significant[res_significant$log2FoldChange < 0,])
+```
+
+Gene Ontology (GO) enrichment analysis:
+
+```{r}
+# GO enrichment analysis
+go_results_over = enrichGO(
+  gene          = res_over, # overexpressed genes list
+  OrgDb         = org.Hs.eg.db, # humans
+  keyType       = "SYMBOL",  
+  ont           = "BP", # biological processes
+  pAdjustMethod = "BH", 
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+```
+
+Enriched biological processes associated with the overexpressed genes:
+
+```{r}
+# print top 6 results
+print(head(go_results_over))
+```
+
+Plot of enriched biological processes:
+
+```{r}
+dotplot(go_results_over, showCategory = 10) + 
+  ggtitle("Gene Ontology Enrichment - overexpressed")
+```
+
+GO analysis of the underexpressed genes:
+
+```{r}
+go_results_under = enrichGO(
+  gene          = res_under, # under expressed genes list
+  OrgDb         = org.Hs.eg.db, # humans
+  keyType       = "SYMBOL",  
+  ont           = "BP", # biological processes
+  pAdjustMethod = "BH", 
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+```
+
+Enriched biological processes associated with the underexpressed genes:
+
+```{r}
+# print top 6 results
+print(head(go_results_under))
+```
+
+Plot of the enriched pathways related to the underexpressed genes:
+
+```{r}
+dotplot(go_results_under, showCategory = 10) +
+  ggtitle("Gene Ontology Enrichment - Underexpressed")
+```
+
+Installing packages for pathway enrichment analysis using Reactome:
+
+```{r}
+if (!requireNamespace("pathview", quietly = TRUE))
+  BiocManager::install("pathview")
+if (!requireNamespace("ReactomePA", quietly = TRUE))
+  BiocManager::install("ReactomePA")
+
+library(ReactomePA)
+library(pathview)
+```
+
+KEGG (Kyoto Encyclopedia of Genes and Genomes) enrichment analysis:
+
+```{r}
+# map genes codes to entrez - required to use Reactome and Kegg functions
+gene_entrez_over = bitr(
+  res_over,
+  fromType = "SYMBOL",
+  toType   = "ENTREZID",
+  OrgDb    = org.Hs.eg.db
+)
+
+gene_entrez_under = bitr(
+  res_under,
+  fromType = "SYMBOL",
+  toType   = "ENTREZID",
+  OrgDb    = org.Hs.eg.db
+)
+
+kegg_results_over = enrichKEGG(
+  gene          = gene_entrez_over[,2],
+  organism      = "human",   
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+
+kegg_results_under = enrichKEGG(
+  gene          = gene_entrez_under[,2],
+  organism      = "human",   
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+```
+
+Significantly enriched KEGG pathways or functional categories for most overexpressed genes:
+
+```{r}
+print(head(kegg_results_over))
+```
+
+```{r}
+dotplot(kegg_results_over, showCategory = 10) + ggtitle("Kegg - overexpressed")
+```
+
+Significantly enriched KEGG pathways or functional categories for most underxpressed genes:
+
+```{r}
+print(head(kegg_results_under))
+```
+
+```{r}
+dotplot(kegg_results_under, showCategory = 10) + ggtitle("Kegg - underexpressed")
+```
+
+Reactome results.
+
+```{r}
+reactome_results_over = enrichPathway(
+  gene          = gene_entrez_over[,2],
+  organism      = "human",   
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+)
+
+reactome_results_under = enrichPathway(
+  gene          = gene_entrez_under[,2],
+  organism      = "human",   
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+)
+```
+
+Pathways associated with overexpressed genes:
+
+```{r}
+print(head(reactome_results_over))
+```
+
+```{r}
+dotplot(reactome_results_over, showCategory = 10) + ggtitle("Reactome - overxpressed")
+```
+
+Pathways associated with underexpressed genes:
+
+```{r}
+print(head(reactome_results_under))
+```
+
+```{r}
+dotplot(reactome_results_under, showCategory=10) + ggtitle("Reactome - underexpressed")
+```
+
+
+## Variance stabilised transformed expression values
+
+Applying a variance stabilizing transformation (VST) to the RNA-seq count data.
+VST automatically normalizes the count data, providing matrix of values which are approximately homoskedastic (have constant variance along the range of mean values).
+
+```{r}
+# variance stabilizing transformation
+vst = vst(dds)
+```
+
+## PCA plot and a heatmap
+
+PCA plot:
+
+```{r}
+# PCA plot of the vst results grouped by the Amplified status
+plotPCA(vst, intgroup=c("Amplified"))
+```
+
+Pacakges for Heatmap:
+
+```{r}
+# install packages for heatmap 
+if (!requireNamespace("pheatmap", quietly = TRUE))
+  install.packages("pheatmap")
+
+library(pheatmap)
+```
+
+Subset of the most differentially expressed genes to visualize:
+
+```{r}
+# sort by p-adjusted 
+genes_sorted = order(res$padj)
+
+# VST results for top 20 genes
+vst_top20 = assay(vst)[genes_sorted[1:20],]
+```
+
+Plotting the heatmap:
+
+```{r}
+# column for annotation
+annotation_column = as.data.frame(colData(dds)[, "Amplified", drop = FALSE])
+
+pheatmap(
+  vst_top20,
+  cluster_rows = TRUE,      
+  cluster_cols = TRUE,  
+  scale = 'row',
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  annotation_col = annotation_column,
+  main = "Heatmap of Gene Expression by ERBB2 Amplified status")
+
+```
+
+## Overall survival model using the glmnet package
+
+Packages:
+
+```{r}
+if (!requireNamespace("glmnet", quietly = TRUE))
+  install.packages("glmnet")
+if (!requireNamespace("survival", quietly = TRUE))
+  install.packages("survival")
+if (!requireNamespace("survminer", quietly = TRUE))
+  install.packages("survminer")
+library(glmnet)
+library(survival)
+library(survminer)
+```
+
+Data preparation: extracting survival times (non-zero and non NA), event status and the corresponding subset of the VST matrix. VST matrix is subset based on correspondence of Sample ID and Patient ID from a clinical info data:
+
+```{r}
+# vst-transformed matrix
+vst_matrix = assay(vst)
+```
+
+```{r}
+# transform patient identifier to match sample IDs in vst_matrix
+# as a result, transforms TCGA-3C-AAAU to TCGA.3C.AAAU
+sample_ids = gsub("-", ".", data_patient$X.Patient.Identifier[5:nrow(data_patient)])
+# extract sample ids from vst without suffix .01
+sample_ids_vst = substr(colnames(vst_matrix), 1, 12)
+
+# convert survival_time and event_status to numeric 
+survival_time = as.numeric(data_patient$Overall.Survival..Months.[5:nrow(data_patient)])
+event_status = data_patient$Overall.Survival.Status[5:nrow(data_patient)] 
+event_status = ifelse(event_status == "1:DECEASED", 1, 0)
+
+# filter out survival time that are less than equal 0
+valid_index = which(survival_time > 0) 
+survival_time = survival_time[valid_index] 
+event_status = event_status[valid_index] 
+sample_ids = sample_ids[valid_index]
+
+# remove rows with NA values
+complete_cases_index = complete.cases(survival_time, event_status) 
+survival_time = survival_time[complete_cases_index] 
+event_status = event_status[complete_cases_index] 
+sample_ids = sample_ids[complete_cases_index]
+```
+
+```{r}
+# match sample IDs derived from Patient IDs and VST sample IDs
+# keep those that present in both
+matching_ids = intersect(sample_ids, sample_ids_vst)
+# their indexes
+matching_index = which(sample_ids %in% matching_ids)
+```
+
+```{r}
+# subset survival_time and event_status by indexes of matching ids
+survival_time = survival_time[matching_index]
+event_status = event_status[matching_index]
+# subset vst_matrix by matching ids 
+matching_ids_vst = colnames(vst_matrix)[substr(colnames(vst_matrix), 1, 12) %in% matching_ids]
+
+vst_matrix = vst_matrix[, matching_ids_vst]
+```
+
+Transpose vst_matrix so that samples are rows, genes are columns:
+
+```{r} 
+vst_matrix = t(vst_matrix)
+```
+
+Check no NA:
+
+```{r}
+sum(is.na(survival_time))  
+sum(is.na(event_status)) 
+sum(is.na(vst_matrix)) 
+```
+
+Create survival object:
+
+```{r}
+survival_object = Surv(time = survival_time, event = event_status) 
+```
+
+Cox model with alpha = 1 to apply lasso penalty:
+
+```{r}
+# Cox model and Lasso regularization using glmnet 
+cox_model = glmnet(vst_matrix, 
+                   survival_object, 
+                   family = "cox",
+                   alpha = 1) # lasso penalty
+```
+
+K-fold (5) cross-validation for glmnet:
+
+```{r}
+# produces a plot and returns a value for lambda
+cv_fit = cv.glmnet(vst_matrix,
+                   survival_object,
+                   family = "cox",
+                   nfolds = 5) # reduced to 5 due to slow execution
+
+# best lambda
+best_lambda = cv_fit$lambda.min
+print(best_lambda)
+```
+
+Survival risk:
+
+```{r}
+# survival risk
+risk_score = predict(cox_model,
+                     s = best_lambda,
+                     newx = vst_matrix)
+
+print(head(risk_score))
+```
+
+Plot data:
+
+```{r}
+# risk scores as data frame to use in a plot
+risk_data = data.frame(survival_time,
+                       event_status,
+                       risk_score = risk_score[,1])
+
+# assign risk catagery based on risk score
+risk_data$risk_group = ifelse(risk_data$risk_score > median(risk_data$risk_score), "High Risk", "Low Risk")
+
+# fit survival curves
+surv_curves_fit = survfit(survival_object ~ risk_group, data = risk_data) 
+
+# Kaplan-Meier curves 
+ggsurvplot(surv_curves_fit,
+           data = risk_data, 
+           pval = TRUE, 
+           risk.table = TRUE, 
+           conf.int = TRUE, 
+           palette = c("#B22222", "#228B22"), 
+           title = "Kaplan-Meier Survival Curves", 
+           legend.title = "Risk Group", 
+           legend.labs = c("Low Risk", "High Risk"))
+
+```
+
+
+
